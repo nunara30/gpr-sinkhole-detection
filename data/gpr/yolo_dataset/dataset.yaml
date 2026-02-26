@@ -1,0 +1,6 @@
+path: G:/RAG_system/data/gpr/yolo_dataset
+train: images/train
+val: images/val
+
+nc: 1
+names: ['sinkhole']

@@ -1,0 +1,63 @@
+name: gpr_rag
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.11
+  - numpy
+  - scipy
+  - matplotlib
+  - h5py
+  - jupyter
+  - ipykernel
+  - pandas
+  - pillow
+  - tqdm
+
+  # PyTorch with CUDA 12.1 (RTX 3060 호환)
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
+
+  # pip으로 설치
+  - pip
+  - pip:
+    # GPR 데이터 파서
+    - readgssi          # GSSI .dzt 파일 읽기
+    - struct2           # .dt1 파싱 보조
+
+    # GPR 처리
+    - gprpy             # GPR 전처리 파이프라인
+
+    # RAG - Vector DB
+    - qdrant-client     # 논문 RAG용
+    - lancedb           # GPR 데이터 RAG용
+
+    # 임베딩
+    - sentence-transformers
+    - openai
+
+    # LangChain
+    - langchain
+    - langchain-community
+    - langchain-openai
+
+    # PDF 처리 (논문 RAG)
+    - pymupdf
+    - pdfplumber
+
+    # YOLO (4주차)
+    - ultralytics       # YOLOv8/v11
+
+    # 데이터 관리
+    - sqlalchemy        # SQLite ORM
+    - alembic
+
+    # 시각화
+    - plotly
+    - seaborn
+    - opencv-python

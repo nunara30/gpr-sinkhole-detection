@@ -1,0 +1,18 @@
+{
+  "freq_hz": 900000000.0,
+  "freq_mhz": 900.0,
+  "depth_m": 2.0,
+  "radius_m": 0.5,
+  "soil_epsr": 12,
+  "velocity_m_ns": 0.08654480535152491,
+  "domain_x": 5.0,
+  "domain_z": 3.0,
+  "dx": 0.01,
+  "n_samples": 512,
+  "n_traces": 500,
+  "dt_ns": 0.16248808860198355,
+  "time_window_ns": 83.19390136421558,
+  "sinkhole_x": 2.5,
+  "method": "analytical_synthesis",
+  "elapsed_s": 0.06
+}

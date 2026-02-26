@@ -1,0 +1,16 @@
+#title: Sinkhole f=400MHz d=1.5m r=0.2m er=12
+#domain: 5.0 3.0 0.005
+#dx_dy_dz: 0.005 0.005 0.005
+#time_window: 1.04e-07
+
+#material: 12 0.01 1 0 soil_er12
+
+#box: 0 0 0 5.0 2.5 0.005 soil_er12
+#cylinder: 2.5 1.0 0  2.5 1.0 0.005  0.2 free_space
+
+#waveform: ricker 1 4.00e+08 my_ricker
+#hertzian_dipole: z 0.01 2.5 0 my_ricker
+#rx: 0.06999999999999999 2.5 0
+
+#src_steps: 0.01 0 0
+#rx_steps: 0.01 0 0

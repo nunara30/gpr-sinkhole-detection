@@ -1,0 +1,28 @@
+# === 실측 원본 데이터 (대용량, 외부 출처) ===
+data/gpr/guangzhou/
+data/gpr/NSGeophysics/
+data/gpr/frenke/
+data/gpr/frenke.zip
+data/gpr/tagliamento/
+
+# === 외부 클론 소스 (참조용, 각자 GitHub 있음) ===
+GPRPy_src/
+gprMax/
+
+# === YOLO pretrained weights (ultralytics 자동 다운로드) ===
+yolo11n.pt
+yolo26n.pt
+
+# === ultralytics 자동 생성 (학습 중 임시) ===
+runs/
+
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+.Python
+*.egg-info/
+
+# === OS ===
+Thumbs.db
+.DS_Store
