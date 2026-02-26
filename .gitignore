@@ -13,8 +13,10 @@ gprMax/
 yolo11n.pt
 yolo26n.pt
 
-# === ultralytics 자동 생성 (학습 중 임시) ===
+# === ultralytics 자동 생성 ===
 runs/
+*.cache
+**/weights/last.pt
 
 # === Python ===
 __pycache__/
@@ -26,3 +28,7 @@ __pycache__/
 # === OS ===
 Thumbs.db
 .DS_Store
+
+# === 기타 ===
+.env
+.ipynb_checkpoints/
