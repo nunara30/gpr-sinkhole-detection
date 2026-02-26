@@ -124,6 +124,15 @@ python src/week3_simulation.py
 python src/week4_yolo_detection.py
 ```
 
+## Troubleshooting (Windows)
+
+| 문제 | 증상 | 해결 |
+|------|------|------|
+| PyTorch CPU-only | `torch.cuda.is_available()` → `False` | `pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu126` |
+| 의존성 깨짐 | force-reinstall 후 `ModuleNotFoundError` | `pip install sqlalchemy scipy h5py`로 복구 |
+| Data Loader DLL crash | `WinError 1455 (paging file too small)` | YOLO 학습 시 `workers=0` 설정 |
+| cv2 채널 불일치 | `img.shape` 언패킹 에러 (3채널 반환) | `img.shape[:2]` 또는 `cv2.IMREAD_GRAYSCALE` 사용 |
+
 ## Requirements
 
 - Python 3.11
