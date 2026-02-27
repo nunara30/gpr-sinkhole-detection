@@ -1,13 +1,18 @@
 """
-Week 4 - YOLOv11 싱크홀 자동 탐지
-합성 B-scan → YOLO 데이터셋 변환 → 학습 → 평가 → 실제 데이터 추론
+Week 4 - YOLOv11 GPR 객체 탐지 (다중 클래스 + negative sampling)
+
+단일 클래스(sinkhole) 기능 유지 + 4클래스 확장:
+  Class 0: sinkhole (공동 → 다중 산란 쌍곡선)
+  Class 1: pipe     (금속관 → 단일 강한 쌍곡선)
+  Class 2: rebar    (철근 배열 → 주기적 소형 쌍곡선)
+  (negative): background (객체 없음 → 빈 라벨, negative sample)
 
 파이프라인:
-  1. 48개 .npy → 640×640 grayscale PNG + YOLO bbox 라벨
-  2. 위치 변경 증강 (×5) + 전처리 버전 (×2) → ~480개
-  3. YOLOv11n 학습 (150 epochs, pretrained backbone)
-  4. 검증 셋 평가 (mAP50 > 0.7 목표)
-  5. 실제 GPR 데이터 추론 (Frenke, Guangzhou)
+  1. 합성 B-scan → 640×640 grayscale PNG + YOLO bbox 라벨
+  2. 위치 변경 증강 (×4) + 전처리 버전 (×2) → ~1100개
+  3. YOLOv11n 학습 (200 epochs, pretrained backbone)
+  4. 검증 셋 평가 (mAP50 > 0.8 목표)
+  5. 실제 GPR 데이터 추론 (Frenke, Guangzhou pipe/rebar/tunnel)
 """
 
 import sys
@@ -37,6 +42,9 @@ from week2_database import GPRDatabase
 from week3_simulation import (
     synthesize_bscan, SCENARIOS, SYNTHETIC_DIR,
     soil_velocity, C0, apply_preprocessing_to_synthetic,
+    synthesize_pipe_bscan, synthesize_rebar_bscan, synthesize_background_bscan,
+    run_multiclass_simulations,
+    PIPE_SCENARIOS, REBAR_SCENARIOS, BACKGROUND_SCENARIOS,
 )
 
 
@@ -53,9 +61,23 @@ YOLO_LABELS_VAL = YOLO_DIR / "labels" / "val"
 YOLO_RUNS_DIR = BASE_DIR / "models" / "yolo_runs"
 OUTPUT_DIR = BASE_DIR / "src" / "output" / "week4"
 
+# 다중 클래스 YOLO 경로
+YOLO_MC_DIR = DATA_DIR / "yolo_multiclass"
+YOLO_MC_IMAGES_TRAIN = YOLO_MC_DIR / "images" / "train"
+YOLO_MC_IMAGES_VAL = YOLO_MC_DIR / "images" / "val"
+YOLO_MC_LABELS_TRAIN = YOLO_MC_DIR / "labels" / "train"
+YOLO_MC_LABELS_VAL = YOLO_MC_DIR / "labels" / "val"
+MC_OUTPUT_DIR = BASE_DIR / "src" / "output" / "week4_multiclass"
+
+# 클래스 매핑
+CLASS_NAMES = ['sinkhole', 'pipe', 'rebar']  # nc=3, background는 빈 라벨
+CLASS_COLORS = {'sinkhole': 'red', 'pipe': 'cyan', 'rebar': 'yellow', 'background': 'gray'}
+
 for d in [YOLO_IMAGES_TRAIN, YOLO_IMAGES_VAL,
           YOLO_LABELS_TRAIN, YOLO_LABELS_VAL,
-          YOLO_RUNS_DIR, OUTPUT_DIR]:
+          YOLO_MC_IMAGES_TRAIN, YOLO_MC_IMAGES_VAL,
+          YOLO_MC_LABELS_TRAIN, YOLO_MC_LABELS_VAL,
+          YOLO_RUNS_DIR, OUTPUT_DIR, MC_OUTPUT_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 
@@ -205,6 +227,161 @@ def generate_shifted_bscan(meta, new_sinkhole_x):
 
 
 # ─────────────────────────────────────────────
+# Step 1-3b: 다중 클래스 bbox + 증강
+# ─────────────────────────────────────────────
+
+def compute_yolo_bbox_multiclass(meta):
+    """
+    다중 클래스 메타데이터에서 YOLO bbox 계산
+
+    Returns: list of (class_id, cx, cy, w, h) 또는 [] (background)
+    """
+    obj_type = meta.get('object_type', 'sinkhole')
+
+    if obj_type == 'background':
+        return []  # 빈 라벨
+
+    if obj_type == 'sinkhole':
+        # 기존 로직 (class_id=0)
+        bbox = compute_yolo_bbox(meta)
+        return [bbox] if bbox else []
+
+    if obj_type == 'pipe':
+        # pipe: 단일 쌍곡선, sinkhole과 유사하되 radius=pipe_diameter/2
+        depth_m = meta['depth_m']
+        pipe_diam = meta['pipe_diameter']
+        pipe_x = meta.get('pipe_x', meta.get('domain_x', 5.0) / 2)
+        soil_epsr = meta['soil_epsr']
+        n_samples = meta['n_samples']
+        n_traces = meta['n_traces']
+        dt_ns = meta['dt_ns']
+        dx = meta['dx']
+
+        v = soil_velocity(soil_epsr)
+        v_m_s = v * 1e9
+
+        radius = pipe_diam / 2
+        d_top = max(0.02, depth_m - radius)
+        d_bottom = depth_m + radius
+
+        dt_s = dt_ns * 1e-9
+        sample_top = (2 * d_top / v_m_s) / dt_s
+        sample_bottom = (2 * d_bottom / v_m_s) / dt_s
+
+        height_samples = sample_bottom - sample_top
+        margin = max(height_samples * 0.2, 5)
+        sample_top = max(0, sample_top - margin)
+        sample_bottom = min(n_samples - 1, sample_bottom + margin)
+
+        # 수평: 쌍곡선 확산 범위
+        if d_bottom > d_top:
+            x_half = np.sqrt(d_bottom ** 2 - d_top ** 2)
+        else:
+            x_half = 2 * radius
+        x_half = max(x_half, 2 * radius)
+
+        trace_center = pipe_x / dx
+        trace_half = x_half / dx
+        trace_left = max(0, trace_center - trace_half)
+        trace_right = min(n_traces - 1, trace_center + trace_half)
+
+        cx = (trace_left + trace_right) / 2 / n_traces
+        cy = (sample_top + sample_bottom) / 2 / n_samples
+        w = (trace_right - trace_left) / n_traces
+        h = (sample_bottom - sample_top) / n_samples
+
+        if w < 0.01 or h < 0.01 or w > 0.95 or h > 0.95:
+            return []
+        cx = np.clip(cx, 0.0, 1.0)
+        cy = np.clip(cy, 0.0, 1.0)
+        w = np.clip(w, 0.01, 1.0)
+        h = np.clip(h, 0.01, 1.0)
+
+        return [(1, cx, cy, w, h)]  # class_id=1
+
+    if obj_type == 'rebar':
+        # rebar: 전체 철근 배열을 감싸는 단일 bbox
+        depth_m = meta['depth_m']
+        rebar_positions = meta['rebar_positions']
+        soil_epsr = meta['soil_epsr']
+        n_samples = meta['n_samples']
+        n_traces = meta['n_traces']
+        dt_ns = meta['dt_ns']
+        dx = meta['dx']
+
+        v = soil_velocity(soil_epsr)
+        v_m_s = v * 1e9
+
+        rebar_radius = 0.008  # 일관성 (week3과 동일)
+        d_top = max(0.02, depth_m - rebar_radius)
+        d_bottom = depth_m + rebar_radius
+
+        dt_s = dt_ns * 1e-9
+        sample_top = (2 * d_top / v_m_s) / dt_s
+        sample_bottom = (2 * d_bottom / v_m_s) / dt_s
+
+        height_samples = sample_bottom - sample_top
+        margin = max(height_samples * 0.3, 8)
+        sample_top = max(0, sample_top - margin)
+        sample_bottom = min(n_samples - 1, sample_bottom + margin)
+
+        # 수평: 첫/마지막 철근 + 쌍곡선 확산
+        x_min_rebar = min(rebar_positions)
+        x_max_rebar = max(rebar_positions)
+        if d_bottom > d_top:
+            x_spread = np.sqrt(d_bottom ** 2 - d_top ** 2)
+        else:
+            x_spread = 0.1
+        x_spread = max(x_spread, 0.05)
+
+        trace_left = max(0, (x_min_rebar - x_spread) / dx)
+        trace_right = min(n_traces - 1, (x_max_rebar + x_spread) / dx)
+
+        cx = (trace_left + trace_right) / 2 / n_traces
+        cy = (sample_top + sample_bottom) / 2 / n_samples
+        w = (trace_right - trace_left) / n_traces
+        h = (sample_bottom - sample_top) / n_samples
+
+        if w < 0.01 or h < 0.01 or w > 0.99 or h > 0.95:
+            return []
+        cx = np.clip(cx, 0.0, 1.0)
+        cy = np.clip(cy, 0.0, 1.0)
+        w = np.clip(w, 0.01, 1.0)
+        h = np.clip(h, 0.01, 1.0)
+
+        return [(2, cx, cy, w, h)]  # class_id=2
+
+    return []
+
+
+def write_yolo_label_multiclass(label_path, bbox_list):
+    """다중 bbox YOLO 라벨 파일 쓰기"""
+    if not bbox_list:
+        label_path.write_text("", encoding='utf-8')
+        return
+    lines = []
+    for (class_id, cx, cy, w, h) in bbox_list:
+        lines.append(f"{class_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
+    label_path.write_text("\n".join(lines) + "\n", encoding='utf-8')
+
+
+def generate_shifted_pipe(meta, new_pipe_x):
+    """파이프 x 위치 변경 재합성"""
+    bscan, _, _, new_meta = synthesize_pipe_bscan(
+        freq_hz=meta['freq_hz'],
+        depth_m=meta['depth_m'],
+        pipe_diameter=meta['pipe_diameter'],
+        soil_epsr=meta['soil_epsr'],
+        domain_x=meta.get('domain_x', 5.0),
+        domain_z=meta.get('domain_z', 3.0),
+        dx=meta['dx'],
+        n_samples=meta['n_samples'],
+        pipe_x=new_pipe_x,
+    )
+    return bscan, new_meta
+
+
+# ─────────────────────────────────────────────
 # Step 1-4: 데이터셋 준비 (전체 파이프라인)
 # ─────────────────────────────────────────────
 
@@ -319,6 +496,192 @@ def prepare_dataset(val_ratio=0.2, n_shift_variants=4, seed=42):
 
 
 # ─────────────────────────────────────────────
+# Step 1-4b: 다중 클래스 데이터셋 준비
+# ─────────────────────────────────────────────
+
+def prepare_multiclass_dataset(val_ratio=0.2, n_shift_variants=4, seed=42):
+    """
+    다중 클래스 YOLO 데이터셋 준비
+
+    - sinkhole (48 base, class 0) — 기존 재사용
+    - pipe (~72 base, class 1)
+    - rebar (~72 base, class 2)
+    - background (~27 base, negative — 빈 라벨)
+    - 위치 증강 (×4) + 전처리 증강 (×2) = ×6 per base
+
+    Returns: summary dict with per-class counts
+    """
+    rng = np.random.RandomState(seed)
+
+    # 기존 데이터 정리
+    for d in [YOLO_MC_IMAGES_TRAIN, YOLO_MC_IMAGES_VAL,
+              YOLO_MC_LABELS_TRAIN, YOLO_MC_LABELS_VAL]:
+        for f in d.glob("*"):
+            f.unlink()
+
+    all_items = []  # (scenario_key, img_name, bscan, meta, obj_type)
+
+    meta_files = sorted(SYNTHETIC_DIR.glob("*_meta.json"))
+    print(f"  총 메타데이터 파일: {len(meta_files)}개")
+
+    class_counts = {'sinkhole': 0, 'pipe': 0, 'rebar': 0, 'background': 0}
+
+    for meta_path in meta_files:
+        meta = json.loads(meta_path.read_text(encoding='utf-8'))
+        label = meta_path.stem.replace('_meta', '')
+        npy_path = SYNTHETIC_DIR / f"{label}.npy"
+        if not npy_path.exists():
+            continue
+
+        bscan = np.load(str(npy_path))
+        obj_type = meta.get('object_type', 'sinkhole')
+
+        # 시나리오 키 (split 기준)
+        freq_mhz = meta.get('freq_mhz', meta['freq_hz'] / 1e6)
+        if obj_type == 'sinkhole':
+            scenario_key = ('sinkhole', freq_mhz, meta['depth_m'],
+                           meta['radius_m'], meta['soil_epsr'])
+        elif obj_type == 'pipe':
+            scenario_key = ('pipe', freq_mhz, meta['depth_m'],
+                           meta['pipe_diameter'], meta['soil_epsr'])
+        elif obj_type == 'rebar':
+            scenario_key = ('rebar', freq_mhz, meta['depth_m'],
+                           meta.get('spacing_m', 0), meta['soil_epsr'])
+        else:
+            scenario_key = ('background', freq_mhz, meta['soil_epsr'],
+                           meta.get('n_layers', 0), 0)
+
+        class_counts[obj_type] += 1
+
+        # (a) 원본
+        all_items.append((scenario_key, f"{label}_raw", bscan, meta, obj_type))
+
+        # (b) 전처리 적용 버전
+        try:
+            # background/pipe/rebar도 전처리 가능하도록 메타 보완
+            meta_for_proc = dict(meta)
+            if 'freq_mhz' not in meta_for_proc:
+                meta_for_proc['freq_mhz'] = meta['freq_hz'] / 1e6
+            if 'dt_ns' not in meta_for_proc:
+                v = soil_velocity(meta['soil_epsr'])
+                dz = meta.get('domain_z', 3.0)
+                meta_for_proc['dt_ns'] = (2 * dz / v * 1.2) / meta['n_samples']
+            if 'dx' not in meta_for_proc:
+                meta_for_proc['dx'] = 0.01
+            processed, _, _ = apply_preprocessing_to_synthetic(bscan, meta_for_proc)
+            all_items.append((scenario_key, f"{label}_proc", processed, meta, obj_type))
+        except Exception as e:
+            pass  # 전처리 실패 시 무시
+
+        # (c) 위치 변경 증강 (sinkhole, pipe만 — rebar/background는 skip)
+        if obj_type == 'sinkhole':
+            shift_positions = rng.uniform(0.8, 4.2, size=n_shift_variants)
+            for si, new_x in enumerate(shift_positions):
+                try:
+                    shifted_bscan, shifted_meta = generate_shifted_bscan(meta, new_x)
+                    all_items.append((scenario_key, f"{label}_shift{si}",
+                                     shifted_bscan, shifted_meta, obj_type))
+                except Exception:
+                    pass
+        elif obj_type == 'pipe':
+            shift_positions = rng.uniform(0.8, 4.2, size=n_shift_variants)
+            for si, new_x in enumerate(shift_positions):
+                try:
+                    shifted_bscan, shifted_meta = generate_shifted_pipe(meta, new_x)
+                    all_items.append((scenario_key, f"{label}_shift{si}",
+                                     shifted_bscan, shifted_meta, obj_type))
+                except Exception:
+                    pass
+        elif obj_type == 'rebar':
+            # rebar: 위치 변경 어려움 (배열 자체가 도메인 중앙) → 2개만 증강
+            for si in range(min(2, n_shift_variants)):
+                try:
+                    shifted_bscan, _, _, shifted_meta = synthesize_rebar_bscan(
+                        freq_hz=meta['freq_hz'],
+                        depth_m=meta['depth_m'],
+                        spacing_m=meta.get('spacing_m', 0.15),
+                        n_rebars=meta.get('n_rebars', 5),
+                        soil_epsr=meta['soil_epsr'],
+                    )
+                    all_items.append((scenario_key, f"{label}_aug{si}",
+                                     shifted_bscan, shifted_meta, obj_type))
+                except Exception:
+                    pass
+        # background: 원본 + 전처리만 (증강 불필요, 이미 다양)
+
+    print(f"  기본 데이터 수: {class_counts}")
+    print(f"  증강 후 총 이미지 수: {len(all_items)}")
+
+    # ── Stratified Train/Val split (클래스별 80/20) ──
+    unique_scenarios = list(set(item[0] for item in all_items))
+    # 클래스별로 분리하여 split
+    scenarios_by_class = {}
+    for sk in unique_scenarios:
+        cls = sk[0]
+        if cls not in scenarios_by_class:
+            scenarios_by_class[cls] = []
+        scenarios_by_class[cls].append(sk)
+
+    val_scenarios = set()
+    for cls, sks in scenarios_by_class.items():
+        rng.shuffle(sks)
+        n_val = max(1, int(len(sks) * val_ratio))
+        for sk in sks[:n_val]:
+            val_scenarios.add(sk)
+
+    train_count = 0
+    val_count = 0
+    skipped = 0
+    per_class = {c: {'train': 0, 'val': 0} for c in ['sinkhole', 'pipe', 'rebar', 'background']}
+
+    for scenario_key, img_name, bscan, meta, obj_type in all_items:
+        # bbox 계산
+        bbox_list = compute_yolo_bbox_multiclass(meta)
+        # background는 bbox_list = [] → 빈 라벨 (정상)
+        if obj_type != 'background' and not bbox_list:
+            skipped += 1
+            continue
+
+        is_val = scenario_key in val_scenarios
+        img_dir = YOLO_MC_IMAGES_VAL if is_val else YOLO_MC_IMAGES_TRAIN
+        lbl_dir = YOLO_MC_LABELS_VAL if is_val else YOLO_MC_LABELS_TRAIN
+
+        png_path = img_dir / f"{img_name}.png"
+        npy_to_png(bscan, png_path)
+
+        lbl_path = lbl_dir / f"{img_name}.txt"
+        write_yolo_label_multiclass(lbl_path, bbox_list)
+
+        split = 'val' if is_val else 'train'
+        per_class[obj_type][split] += 1
+        if is_val:
+            val_count += 1
+        else:
+            train_count += 1
+
+    summary = {
+        'total': train_count + val_count,
+        'train': train_count,
+        'val': val_count,
+        'skipped': skipped,
+        'per_class': per_class,
+    }
+
+    print(f"\n  === 다중 클래스 데이터셋 요약 ===")
+    print(f"  {'클래스':<12} {'Train':>6} {'Val':>6} {'Total':>6}")
+    print(f"  {'-'*32}")
+    for cls in ['sinkhole', 'pipe', 'rebar', 'background']:
+        t = per_class[cls]['train']
+        v = per_class[cls]['val']
+        print(f"  {cls:<12} {t:>6} {v:>6} {t+v:>6}")
+    print(f"  {'-'*32}")
+    print(f"  {'합계':<12} {train_count:>6} {val_count:>6} {train_count+val_count:>6}")
+    print(f"  Skipped: {skipped}")
+
+    return summary
+
+
+# ─────────────────────────────────────────────
 # Step 1-5: dataset.yaml 생성
 # ─────────────────────────────────────────────
 
@@ -334,6 +697,21 @@ names: ['sinkhole']
     yaml_path = YOLO_DIR / "dataset.yaml"
     yaml_path.write_text(yaml_content, encoding='utf-8')
     print(f"  dataset.yaml: {yaml_path}")
+    return yaml_path
+
+
+def create_multiclass_yaml():
+    """다중 클래스 YOLO dataset.yaml 생성 (nc=3, background는 빈 라벨)"""
+    yaml_content = f"""path: {str(YOLO_MC_DIR).replace(chr(92), '/')}
+train: images/train
+val: images/val
+
+nc: 3
+names: ['sinkhole', 'pipe', 'rebar']
+"""
+    yaml_path = YOLO_MC_DIR / "dataset.yaml"
+    yaml_path.write_text(yaml_content, encoding='utf-8')
+    print(f"  multiclass dataset.yaml: {yaml_path}")
     return yaml_path
 
 
@@ -941,99 +1319,656 @@ def log_to_database(db, dataset_summary, metrics, real_results):
 
 
 # ─────────────────────────────────────────────
+# Step 6: 다중 클래스 학습/평가/추론
+# ─────────────────────────────────────────────
+
+def verify_multiclass_labels(n_per_class=2, save_path=None):
+    """다중 클래스 bbox 검증 시각화 (클래스별 샘플)"""
+    train_pngs = sorted(YOLO_MC_IMAGES_TRAIN.glob("*.png"))
+    if not train_pngs:
+        print("  검증할 이미지 없음")
+        return
+
+    # 클래스별 샘플 수집
+    class_samples = {'sinkhole': [], 'pipe': [], 'rebar': [], 'background': []}
+    for png_path in train_pngs:
+        name = png_path.stem
+        if name.startswith('pipe_'):
+            cls = 'pipe'
+        elif name.startswith('rebar_'):
+            cls = 'rebar'
+        elif name.startswith('bg_'):
+            cls = 'background'
+        else:
+            cls = 'sinkhole'
+        if len(class_samples[cls]) < n_per_class:
+            class_samples[cls].append(png_path)
+
+    all_selected = []
+    for cls in ['sinkhole', 'pipe', 'rebar', 'background']:
+        all_selected.extend([(cls, p) for p in class_samples[cls]])
+
+    n_total = len(all_selected)
+    if n_total == 0:
+        return
+
+    cols = min(4, n_total)
+    rows = (n_total + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 5 * rows))
+    axes = np.array(axes).flatten()
+
+    color_map = {0: 'red', 1: 'cyan', 2: 'yellow'}
+
+    for idx, (cls, png_path) in enumerate(all_selected):
+        ax = axes[idx]
+        img = cv2.imread(str(png_path), cv2.IMREAD_GRAYSCALE)
+        ax.imshow(img, cmap='gray', aspect='equal')
+
+        lbl_path = YOLO_MC_LABELS_TRAIN / f"{png_path.stem}.txt"
+        if lbl_path.exists():
+            text = lbl_path.read_text().strip()
+            if text:
+                for line in text.split('\n'):
+                    parts = line.strip().split()
+                    cls_id = int(parts[0])
+                    cx, cy, w, h = map(float, parts[1:5])
+                    img_h, img_w = img.shape
+                    px = (cx - w / 2) * img_w
+                    py = (cy - h / 2) * img_h
+                    rect = Rectangle((px, py), w * img_w, h * img_h,
+                                     linewidth=2,
+                                     edgecolor=color_map.get(cls_id, 'white'),
+                                     facecolor='none', linestyle='--')
+                    ax.add_patch(rect)
+                    cls_name = CLASS_NAMES[cls_id] if cls_id < len(CLASS_NAMES) else '?'
+                    ax.text(px, py - 3, cls_name, color=color_map.get(cls_id, 'white'),
+                            fontsize=8, fontweight='bold')
+                ax.set_title(f"[{cls}] {png_path.stem}", fontsize=6)
+            else:
+                ax.set_title(f"[{cls}] {png_path.stem}\n(negative)", fontsize=6)
+        ax.axis('off')
+
+    for i in range(n_total, len(axes)):
+        axes[i].set_visible(False)
+
+    fig.suptitle("Multiclass Label Verification\n(red=sinkhole, cyan=pipe, yellow=rebar)",
+                 fontsize=12, fontweight='bold')
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"  저장: {save_path}")
+    plt.close(fig)
+
+
+def train_multiclass(dataset_yaml, model_name="yolo11n.pt", epochs=200,
+                     batch=8, patience=40):
+    """다중 클래스 YOLO 학습"""
+    from ultralytics import YOLO
+
+    try:
+        model = YOLO(model_name)
+        print(f"  모델: {model_name}")
+    except Exception:
+        model_name = "yolov8n.pt"
+        model = YOLO(model_name)
+        print(f"  Fallback 모델: {model_name}")
+
+    train_kwargs = dict(
+        data=str(dataset_yaml),
+        epochs=epochs,
+        batch=batch,
+        imgsz=640,
+        patience=patience,
+        optimizer='AdamW',
+        lr0=0.001,
+        cos_lr=True,
+        dropout=0.1,
+        freeze=10,
+        label_smoothing=0.05,
+        # Augmentation
+        fliplr=0.5,
+        flipud=0.0,
+        mosaic=0.5,
+        degrees=0.0,
+        hsv_v=0.3,
+        translate=0.15,
+        scale=0.3,
+        workers=0,
+        project=str(YOLO_RUNS_DIR),
+        name="multiclass_detect",
+        exist_ok=True,
+        verbose=True,
+    )
+
+    try:
+        results = model.train(**train_kwargs)
+    except RuntimeError as e:
+        if "out of memory" in str(e).lower() or "CUDA" in str(e):
+            print(f"  OOM → batch={batch//2}로 재시도")
+            import torch
+            torch.cuda.empty_cache()
+            train_kwargs['batch'] = batch // 2
+            results = model.train(**train_kwargs)
+        else:
+            raise
+
+    best_path = YOLO_RUNS_DIR / "multiclass_detect" / "weights" / "best.pt"
+    if not best_path.exists():
+        for p in YOLO_RUNS_DIR.rglob("best.pt"):
+            best_path = p
+            break
+    print(f"  Best model: {best_path}")
+    return best_path
+
+
+def evaluate_multiclass(weights_path, dataset_yaml):
+    """다중 클래스 모델 평가 (클래스별 메트릭)"""
+    from ultralytics import YOLO
+
+    model = YOLO(str(weights_path))
+    results = model.val(data=str(dataset_yaml), imgsz=640, verbose=True)
+
+    metrics = {
+        'mAP50': float(results.box.map50),
+        'mAP50_95': float(results.box.map),
+        'precision': float(results.box.mp),
+        'recall': float(results.box.mr),
+    }
+    p, r = metrics['precision'], metrics['recall']
+    metrics['f1'] = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+
+    # 클래스별 메트릭
+    per_class_metrics = {}
+    try:
+        ap50_per = results.box.ap50
+        for i, cls_name in enumerate(CLASS_NAMES):
+            if i < len(ap50_per):
+                per_class_metrics[cls_name] = {
+                    'ap50': float(ap50_per[i]),
+                }
+    except Exception:
+        pass
+    metrics['per_class'] = per_class_metrics
+
+    print(f"\n  === 다중 클래스 평가 결과 ===")
+    print(f"  전체 mAP50:     {metrics['mAP50']:.4f}")
+    print(f"  전체 mAP50-95:  {metrics['mAP50_95']:.4f}")
+    print(f"  전체 Precision: {metrics['precision']:.4f}")
+    print(f"  전체 Recall:    {metrics['recall']:.4f}")
+    print(f"  전체 F1:        {metrics['f1']:.4f}")
+    if per_class_metrics:
+        print(f"\n  클래스별 AP50:")
+        for cls_name, m in per_class_metrics.items():
+            ap = m.get('ap50', 0)
+            status = '✓' if ap >= 0.7 else '✗'
+            print(f"    {status} {cls_name}: {ap:.4f}")
+
+    target = 0.8
+    if metrics['mAP50'] >= target:
+        print(f"\n  ✓ 전체 mAP50 목표 달성 ({metrics['mAP50']:.3f} >= {target})")
+    else:
+        print(f"\n  ✗ 전체 mAP50 목표 미달 ({metrics['mAP50']:.3f} < {target})")
+
+    return metrics
+
+
+def visualize_multiclass_predictions(weights_path, n_samples=8, save_path=None):
+    """다중 클래스 검증 셋 예측 시각화"""
+    from ultralytics import YOLO
+
+    model = YOLO(str(weights_path))
+    val_pngs = sorted(YOLO_MC_IMAGES_VAL.glob("*.png"))
+    if not val_pngs:
+        print("  시각화할 이미지 없음")
+        return
+
+    indices = np.random.choice(len(val_pngs), min(n_samples, len(val_pngs)),
+                               replace=False)
+    selected = [val_pngs[i] for i in indices]
+
+    cols = min(4, len(selected))
+    rows = (len(selected) + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 5 * rows))
+    axes = np.array(axes).flatten()
+
+    gt_colors = {0: 'red', 1: 'cyan', 2: 'yellow'}
+    pred_colors = {0: 'lime', 1: 'deepskyblue', 2: 'orange'}
+
+    for idx, (ax, png_path) in enumerate(zip(axes, selected)):
+        img = cv2.imread(str(png_path), cv2.IMREAD_GRAYSCALE)
+        ax.imshow(img, cmap='gray', aspect='equal')
+        img_h, img_w = img.shape[:2]
+
+        # GT bbox
+        lbl_path = YOLO_MC_LABELS_VAL / f"{png_path.stem}.txt"
+        if lbl_path.exists():
+            text = lbl_path.read_text().strip()
+            if text:
+                for line in text.split('\n'):
+                    parts = line.strip().split()
+                    cls_id = int(parts[0])
+                    cx, cy, w, h = map(float, parts[1:5])
+                    px = (cx - w / 2) * img_w
+                    py = (cy - h / 2) * img_h
+                    rect = Rectangle((px, py), w * img_w, h * img_h,
+                                     linewidth=2,
+                                     edgecolor=gt_colors.get(cls_id, 'red'),
+                                     facecolor='none', linestyle='--')
+                    ax.add_patch(rect)
+
+        # Predictions
+        results = model.predict(str(png_path), imgsz=640, conf=0.25, verbose=False)
+        if results and len(results[0].boxes):
+            for box in results[0].boxes:
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                conf = float(box.conf[0].cpu().numpy())
+                cls_id = int(box.cls[0].cpu().numpy())
+                color = pred_colors.get(cls_id, 'lime')
+                cls_name = CLASS_NAMES[cls_id] if cls_id < len(CLASS_NAMES) else '?'
+                rect = Rectangle((x1, y1), x2 - x1, y2 - y1,
+                                 linewidth=2, edgecolor=color, facecolor='none')
+                ax.add_patch(rect)
+                ax.text(x1, y1 - 3, f'{cls_name} {conf:.2f}', color=color,
+                        fontsize=7, fontweight='bold')
+
+        ax.set_title(png_path.stem, fontsize=6)
+        ax.axis('off')
+
+    for i in range(len(selected), len(axes)):
+        axes[i].set_visible(False)
+
+    from matplotlib.lines import Line2D
+    legend_elements = [
+        Line2D([0], [0], color='red', linewidth=2, linestyle='--', label='GT sinkhole'),
+        Line2D([0], [0], color='cyan', linewidth=2, linestyle='--', label='GT pipe'),
+        Line2D([0], [0], color='yellow', linewidth=2, linestyle='--', label='GT rebar'),
+        Line2D([0], [0], color='lime', linewidth=2, label='Pred sinkhole'),
+        Line2D([0], [0], color='deepskyblue', linewidth=2, label='Pred pipe'),
+        Line2D([0], [0], color='orange', linewidth=2, label='Pred rebar'),
+    ]
+    fig.legend(handles=legend_elements, loc='upper right', fontsize=8,
+               ncol=2)
+    fig.suptitle("Multiclass Val: GT (dashed) vs Predicted (solid)",
+                 fontsize=12, fontweight='bold')
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"  저장: {save_path}")
+    plt.close(fig)
+
+
+def inference_multiclass_real(weights_path, output_dir=None):
+    """
+    다중 클래스 모델로 실측 데이터 zero-shot 추론
+
+    - Guangzhou pipe → pipe 탐지 기대
+    - Guangzhou rebar → rebar 탐지 기대
+    - Guangzhou tunnel → background (탐지 없음) 기대
+    - Frenke LINE00 → background (탐지 없음) 기대
+    """
+    from ultralytics import YOLO
+
+    if output_dir is None:
+        output_dir = MC_OUTPUT_DIR
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    model = YOLO(str(weights_path))
+    results_summary = []
+
+    # 실측 데이터 소스
+    real_datasets = [
+        {
+            'name': 'Guangzhou pipe',
+            'dir': DATA_DIR / "guangzhou/Data Set/pipe",
+            'expected_class': 'pipe',
+            'max_files': 5,
+        },
+        {
+            'name': 'Guangzhou rebar',
+            'dir': DATA_DIR / "guangzhou/Data Set/rebar",
+            'expected_class': 'rebar',
+            'max_files': 5,
+        },
+        {
+            'name': 'Guangzhou tunnel',
+            'dir': DATA_DIR / "guangzhou/Data Set/tunnel",
+            'expected_class': 'background',
+            'max_files': 5,
+        },
+    ]
+
+    fig_rows = []
+
+    for ds_info in real_datasets:
+        ds_dir = ds_info['dir']
+        if not ds_dir.exists():
+            print(f"  [{ds_info['name']}] 디렉토리 없음: {ds_dir}")
+            continue
+
+        dt_files = sorted(
+            f for f in ds_dir.rglob("*.dt")
+            if 'ASCII' not in str(f)
+        )
+        if not dt_files:
+            print(f"  [{ds_info['name']}] .dt 파일 없음")
+            continue
+
+        sample_files = dt_files[:ds_info['max_files']]
+        print(f"\n  [{ds_info['name']}] {len(sample_files)}개 추론...")
+
+        ds_detections = {'sinkhole': 0, 'pipe': 0, 'rebar': 0, 'none': 0}
+        sample_images = []
+
+        for dt_file in sample_files:
+            data, header = read_ids_dt(str(dt_file))
+            if data is None:
+                continue
+
+            img = _prepare_real_image(data)
+            tmp_path = output_dir / f"_tmp_{dt_file.stem}.png"
+            cv2.imwrite(str(tmp_path), img)
+
+            pred = model.predict(str(tmp_path), imgsz=640, conf=0.25, verbose=False)
+
+            det_classes = []
+            if pred and len(pred[0].boxes):
+                for box in pred[0].boxes:
+                    cls_id = int(box.cls[0].cpu().numpy())
+                    if cls_id < len(CLASS_NAMES):
+                        ds_detections[CLASS_NAMES[cls_id]] += 1
+                        det_classes.append(CLASS_NAMES[cls_id])
+            if not det_classes:
+                ds_detections['none'] += 1
+
+            if len(sample_images) < 2:
+                sample_images.append((img, pred, dt_file.stem))
+
+            tmp_path.unlink(missing_ok=True)
+
+        results_summary.append({
+            'dataset': ds_info['name'],
+            'expected': ds_info['expected_class'],
+            'detections': ds_detections,
+            'n_files': len(sample_files),
+        })
+        fig_rows.append((ds_info['name'], ds_info['expected_class'], sample_images))
+
+        print(f"    탐지 결과: {ds_detections}")
+
+    # Frenke LINE00
+    frenke_path = DATA_DIR / "frenke/2014_04_25_frenke/rawGPR/LINE00.DT1"
+    if frenke_path.exists():
+        print(f"\n  [Frenke LINE00] 추론...")
+        data_frenke, header_frenke = read_dt1(str(frenke_path))
+        img = _prepare_real_image(data_frenke)
+        tmp_path = output_dir / "_tmp_frenke.png"
+        cv2.imwrite(str(tmp_path), img)
+        pred = model.predict(str(tmp_path), imgsz=640, conf=0.25, verbose=False)
+
+        n_det = len(pred[0].boxes) if pred and pred[0].boxes is not None else 0
+        frenke_classes = {}
+        if pred and len(pred[0].boxes):
+            for box in pred[0].boxes:
+                cls_id = int(box.cls[0].cpu().numpy())
+                cls_name = CLASS_NAMES[cls_id] if cls_id < len(CLASS_NAMES) else '?'
+                frenke_classes[cls_name] = frenke_classes.get(cls_name, 0) + 1
+
+        results_summary.append({
+            'dataset': 'Frenke LINE00',
+            'expected': 'background',
+            'detections': frenke_classes if frenke_classes else {'none': 1},
+            'n_files': 1,
+        })
+        print(f"    탐지: {n_det}개 {frenke_classes}")
+        tmp_path.unlink(missing_ok=True)
+
+    # 시각화: 실측 추론 결과 그리드
+    if fig_rows:
+        n_rows = len(fig_rows)
+        fig, axes = plt.subplots(n_rows, 2, figsize=(12, 5 * n_rows))
+        if n_rows == 1:
+            axes = axes.reshape(1, -1)
+
+        pred_colors = {0: 'lime', 1: 'deepskyblue', 2: 'orange'}
+
+        for row_idx, (ds_name, expected, samples) in enumerate(fig_rows):
+            for col_idx in range(2):
+                ax = axes[row_idx, col_idx]
+                if col_idx < len(samples):
+                    img, pred, name = samples[col_idx]
+                    ax.imshow(img, cmap='gray', aspect='equal')
+                    n_det = 0
+                    if pred and len(pred[0].boxes):
+                        for box in pred[0].boxes:
+                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                            conf = float(box.conf[0].cpu().numpy())
+                            cls_id = int(box.cls[0].cpu().numpy())
+                            color = pred_colors.get(cls_id, 'lime')
+                            cls_name = CLASS_NAMES[cls_id] if cls_id < len(CLASS_NAMES) else '?'
+                            rect = Rectangle((x1, y1), x2 - x1, y2 - y1,
+                                             linewidth=2, edgecolor=color,
+                                             facecolor='none')
+                            ax.add_patch(rect)
+                            ax.text(x1, y1 - 3, f'{cls_name} {conf:.2f}',
+                                    color=color, fontsize=8, fontweight='bold')
+                            n_det += 1
+                    ax.set_title(f"{ds_name}\n{name} ({n_det} det)\nExpected: {expected}",
+                                 fontsize=8)
+                else:
+                    ax.text(0.5, 0.5, 'N/A', transform=ax.transAxes,
+                            ha='center', va='center')
+                ax.axis('off')
+
+        fig.suptitle("Multiclass Real Data Inference (Zero-shot)",
+                     fontsize=13, fontweight='bold')
+        plt.tight_layout()
+        save_p = output_dir / "multiclass_real_inference.png"
+        fig.savefig(save_p, dpi=150, bbox_inches='tight')
+        print(f"  저장: {save_p}")
+        plt.close(fig)
+
+    return results_summary
+
+
+def log_multiclass_to_database(db, dataset_summary, metrics, real_results):
+    """다중 클래스 결과를 DB에 기록"""
+    dummy_data = np.zeros((640, 640), dtype=np.float32)
+    ds_id = db.register_dataset(
+        name=f"YOLO Multiclass Dataset (n={dataset_summary['total']})",
+        file_path=str(YOLO_MC_DIR / "dataset.yaml"),
+        data=dummy_data,
+        format="YOLO_multiclass_dataset",
+        frequency_mhz=0,
+        time_window_ns=0,
+        dx_m=0,
+    )
+
+    steps = [
+        {
+            'step_name': 'Multiclass_Dataset',
+            'parameters': {
+                'train': dataset_summary['train'],
+                'val': dataset_summary['val'],
+                'total': dataset_summary['total'],
+                'per_class': {k: v for k, v in dataset_summary.get('per_class', {}).items()},
+            },
+            'elapsed_ms': 0,
+        },
+        {
+            'step_name': 'Multiclass_Training',
+            'parameters': {
+                'model': 'yolo11n',
+                'epochs': 200,
+                'batch': 8,
+                'nc': 3,
+                'label_smoothing': 0.05,
+            },
+            'elapsed_ms': 0,
+        },
+        {
+            'step_name': 'Multiclass_Evaluation',
+            'parameters': {
+                k: v for k, v in metrics.items() if k != 'per_class'
+            },
+            'elapsed_ms': 0,
+        },
+    ]
+
+    if real_results:
+        real_params = {}
+        for r in real_results:
+            real_params[r['dataset']] = str(r.get('detections', {}))
+        steps.append({
+            'step_name': 'Multiclass_Real_Inference',
+            'parameters': real_params,
+            'elapsed_ms': 0,
+        })
+
+    db.log_processing_run(ds_id, "Week4 Multiclass YOLO Detection", steps)
+    return ds_id
+
+
+# ─────────────────────────────────────────────
 # 메인 실행
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
     warnings.filterwarnings('ignore', category=FutureWarning)
 
-    print("=" * 60)
-    print("  Week 4 - YOLOv11 Sinkhole Detection")
-    print("=" * 60)
+    # ── 모드 선택: multiclass (기본) vs singleclass ──
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--mode', choices=['single', 'multi'], default='multi',
+                        help='single: 기존 단일 클래스, multi: 다중 클래스')
+    parser.add_argument('--skip-synth', action='store_true',
+                        help='합성 데이터 생성 건너뛰기 (이미 존재할 때)')
+    args = parser.parse_args()
 
     t_start = time.perf_counter()
     db = GPRDatabase()
 
-    # ── Step 1: 데이터 준비 ──
-    print("\n[1] 데이터셋 준비...")
-    print("  1-1. B-scan → PNG + YOLO 라벨 변환")
-    print("  1-2. 위치 변경 증강 (×5)")
-    print("  1-3. 전처리 버전 (×2)")
+    if args.mode == 'single':
+        # ════════════════════════════════════════
+        #   단일 클래스 (기존 Week 4 코드)
+        # ════════════════════════════════════════
+        print("=" * 60)
+        print("  Week 4 - YOLOv11 Sinkhole Detection (Single Class)")
+        print("=" * 60)
 
-    dataset_summary = prepare_dataset(val_ratio=0.2, n_shift_variants=4)
+        print("\n[1] 데이터셋 준비...")
+        dataset_summary = prepare_dataset(val_ratio=0.2, n_shift_variants=4)
+        yaml_path = create_dataset_yaml()
+        verify_labels(n_samples=4, save_path=OUTPUT_DIR / "bbox_verification.png")
 
-    print(f"\n  1-4. dataset.yaml 생성")
-    yaml_path = create_dataset_yaml()
+        print("\n[2] YOLOv11n 학습...")
+        best_weights = train_yolo(yaml_path, epochs=150, batch=8, patience=30)
 
-    print(f"\n  1-5. 라벨 검증 시각화")
-    verify_labels(n_samples=4, save_path=OUTPUT_DIR / "bbox_verification.png")
+        print("\n[3] 평가...")
+        metrics = evaluate_model(best_weights, yaml_path)
+        visualize_predictions(best_weights, save_path=OUTPUT_DIR / "val_predictions.png")
+        analyze_performance_by_param(best_weights, save_path=OUTPUT_DIR / "param_analysis.png")
 
-    t_data = time.perf_counter() - t_start
-    print(f"\n  데이터 준비 완료: {t_data:.1f}s")
+        print("\n[4] 실제 데이터 추론...")
+        real_results = inference_on_real_data(best_weights, output_dir=OUTPUT_DIR)
 
-    # ── Step 2: 모델 학습 ──
-    print("\n[2] YOLOv11n 학습...")
-    t_train_start = time.perf_counter()
+        print("\n[5] DB 기록...")
+        log_to_database(db, dataset_summary, metrics, real_results)
 
-    best_weights = train_yolo(
-        dataset_yaml=yaml_path,
-        model_name="yolo11n.pt",
-        epochs=150,
-        batch=8,
-        patience=30,
-    )
+    else:
+        # ════════════════════════════════════════
+        #   다중 클래스 (4클래스 확장 + negative)
+        # ════════════════════════════════════════
+        print("=" * 60)
+        print("  Week 4 - Multiclass YOLO Detection")
+        print("  (sinkhole + pipe + rebar + background)")
+        print("=" * 60)
 
-    t_train = time.perf_counter() - t_train_start
-    print(f"\n  학습 완료: {t_train/60:.1f}분")
+        # ── Step 1: 합성 데이터 생성 ──
+        if not args.skip_synth:
+            print("\n[1] 다중 클래스 합성 데이터 생성...")
+            synth_results = run_multiclass_simulations(db=db)
+            print(f"  신규 합성: {len(synth_results)}개")
+        else:
+            print("\n[1] 합성 데이터 생성 건너뛰기 (--skip-synth)")
 
-    # ── Step 3: 평가 ──
-    print("\n[3] 모델 평가...")
-    metrics = evaluate_model(best_weights, yaml_path)
+        # ── Step 2: 데이터셋 준비 ──
+        print("\n[2] 다중 클래스 YOLO 데이터셋 준비...")
+        mc_summary = prepare_multiclass_dataset(
+            val_ratio=0.2, n_shift_variants=4, seed=42)
+        mc_yaml = create_multiclass_yaml()
 
-    print("\n  예측 시각화...")
-    visualize_predictions(
-        best_weights, n_samples=6,
-        save_path=OUTPUT_DIR / "val_predictions.png",
-    )
+        print("\n  라벨 검증 시각화...")
+        verify_multiclass_labels(
+            n_per_class=2,
+            save_path=MC_OUTPUT_DIR / "multiclass_bbox_verify.png")
 
-    print("\n  파라미터별 성능 분석...")
-    analyze_performance_by_param(
-        best_weights,
-        save_path=OUTPUT_DIR / "param_analysis.png",
-    )
+        t_data = time.perf_counter() - t_start
+        print(f"\n  데이터 준비 완료: {t_data:.1f}s")
 
-    # ── Step 4: 실제 데이터 추론 ──
-    print("\n[4] 실제 데이터 추론 (zero-shot)...")
-    real_results = inference_on_real_data(best_weights, output_dir=OUTPUT_DIR)
+        # ── Step 3: 학습 ──
+        print("\n[3] 다중 클래스 YOLO 학습...")
+        t_train_start = time.perf_counter()
+        mc_weights = train_multiclass(
+            mc_yaml, model_name="yolo11n.pt",
+            epochs=200, batch=8, patience=40)
+        t_train = time.perf_counter() - t_train_start
+        print(f"\n  학습 완료: {t_train/60:.1f}분")
 
-    # ── Step 5: DB 기록 ──
-    print("\n[5] DB 기록...")
-    log_to_database(db, dataset_summary, metrics, real_results)
+        # ── Step 4: 평가 ──
+        print("\n[4] 다중 클래스 평가...")
+        mc_metrics = evaluate_multiclass(mc_weights, mc_yaml)
 
-    # ── 최종 요약 ──
-    t_total = time.perf_counter() - t_start
-    print("\n" + "=" * 60)
-    print("  Week 4 최종 요약")
-    print("=" * 60)
-    print(f"  데이터셋: {dataset_summary['total']}개 "
-          f"(train={dataset_summary['train']}, val={dataset_summary['val']})")
-    print(f"  mAP50: {metrics['mAP50']:.4f} "
-          f"({'✓ 달성' if metrics['mAP50'] >= 0.7 else '✗ 미달'})")
-    print(f"  Precision: {metrics['precision']:.4f}")
-    print(f"  Recall: {metrics['recall']:.4f}")
-    print(f"  F1: {metrics['f1']:.4f}")
-    if real_results:
-        print(f"  실제 데이터 추론:")
-        for r in real_results:
-            print(f"    {r['dataset']}: raw={r['raw_detections']} "
-                  f"/ proc={r['proc_detections']} detections")
-    print(f"\n  총 소요 시간: {t_total/60:.1f}분")
-    print(f"  출력:")
-    for f in ['bbox_verification.png', 'val_predictions.png',
-              'param_analysis.png', 'real_frenke.png', 'real_guangzhou.png']:
-        p = OUTPUT_DIR / f
-        print(f"    {'✓' if p.exists() else '✗'} {f}")
-    print(f"  모델: {best_weights}")
+        print("\n  예측 시각화...")
+        visualize_multiclass_predictions(
+            mc_weights, n_samples=8,
+            save_path=MC_OUTPUT_DIR / "multiclass_val_predictions.png")
+
+        # ── Step 5: 실측 추론 ──
+        print("\n[5] 실측 데이터 zero-shot 추론...")
+        mc_real_results = inference_multiclass_real(
+            mc_weights, output_dir=MC_OUTPUT_DIR)
+
+        # ── Step 6: DB 기록 ──
+        print("\n[6] DB 기록...")
+        log_multiclass_to_database(db, mc_summary, mc_metrics, mc_real_results)
+
+        # ── 최종 요약 ──
+        t_total = time.perf_counter() - t_start
+        print("\n" + "=" * 60)
+        print("  다중 클래스 YOLO 최종 요약")
+        print("=" * 60)
+        print(f"\n  데이터셋: {mc_summary['total']}개 "
+              f"(train={mc_summary['train']}, val={mc_summary['val']})")
+        if 'per_class' in mc_summary:
+            for cls, counts in mc_summary['per_class'].items():
+                print(f"    {cls}: train={counts['train']}, val={counts['val']}")
+
+        print(f"\n  전체 mAP50: {mc_metrics['mAP50']:.4f} "
+              f"({'✓' if mc_metrics['mAP50'] >= 0.8 else '✗'})")
+        print(f"  Precision:  {mc_metrics['precision']:.4f}")
+        print(f"  Recall:     {mc_metrics['recall']:.4f}")
+        print(f"  F1:         {mc_metrics['f1']:.4f}")
+
+        if mc_metrics.get('per_class'):
+            print(f"\n  클래스별 AP50:")
+            for cls_name, m in mc_metrics['per_class'].items():
+                print(f"    {cls_name}: {m.get('ap50', 0):.4f}")
+
+        if mc_real_results:
+            print(f"\n  실측 추론:")
+            for r in mc_real_results:
+                print(f"    {r['dataset']} (expected={r['expected']}): "
+                      f"{r.get('detections', {})}")
+
+        print(f"\n  총 소요 시간: {t_total/60:.1f}분")
+        print(f"  출력:")
+        for f_name in ['multiclass_bbox_verify.png',
+                        'multiclass_val_predictions.png',
+                        'multiclass_real_inference.png']:
+            p = MC_OUTPUT_DIR / f_name
+            print(f"    {'✓' if p.exists() else '✗'} {f_name}")
+        print(f"  모델: {mc_weights}")
 
     db.print_summary()
     print("완료!")

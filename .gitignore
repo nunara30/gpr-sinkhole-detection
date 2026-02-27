@@ -29,6 +29,29 @@ __pycache__/
 Thumbs.db
 .DS_Store
 
+# === 합성 데이터 바이너리 (스크립트로 재생성 가능) ===
+data/gpr/synthetic/*.npy
+data/gpr/synthetic/*_meta.json
+data/gpr/fdtd_bscan/
+
+# === 생성된 YOLO 데이터셋 이미지/라벨 (대용량, 스크립트로 재생성 가능) ===
+data/gpr/yolo_multiclass/images/
+data/gpr/yolo_multiclass/labels/
+data/gpr/yolo_pseudolabel/images/
+data/gpr/yolo_pseudolabel/labels/
+data/gpr/yolo_mixed_real/images/
+data/gpr/yolo_mixed_real/labels/
+
+# === Mendeley GPR 데이터 (CC BY 4.0, Mendeley에서 직접 다운로드) ===
+data/gpr/mendeley_gpr/
+
+# === FDTD .out 파일 (HDF5 대용량, gprMax 재실행으로 재생성) ===
+models/fdtd_compact/*.out
+
+# === 로그 파일 ===
+src/output/phase_*.txt
+src/output/phase_*.log
+
 # === 기타 ===
 .env
 .ipynb_checkpoints/

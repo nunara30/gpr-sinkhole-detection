@@ -1,12 +1,16 @@
 """
-Week 3 - GPR 싱크홀 시뮬레이션 (gprMax .in 생성 + 해석적 합성 B-scan)
+Week 3 - GPR 시뮬레이션 (gprMax .in 생성 + 해석적 합성 B-scan)
 
 gprMax FDTD 빌드 불가 시 해석적 방법으로 합성 B-scan 생성:
   - Ricker wavelet convolution
   - Diffraction hyperbola: t(x) = 2/v * sqrt((x-x0)^2 + d^2)
-  - Direct wave, ground reflection, sinkhole reflection
+  - Direct wave, ground reflection, object reflection
 
-48 시나리오: 2(freq) × 4(depth) × 3(radius) × 2(soil)
+다중 클래스:
+  - sinkhole: 48 시나리오 (기존)
+  - pipe: 72 시나리오 (금속관, 단일 강한 쌍곡선)
+  - rebar: ~72 시나리오 (철근 배열, 주기적 소형 쌍곡선)
+  - background: 27 시나리오 (객체 없음, negative sample)
 """
 
 import sys
@@ -401,6 +405,501 @@ def synthesize_no_sinkhole(soil_epsr, freq_hz, domain_x=5.0, domain_z=3.0,
         n_samples=n_samples,
         add_noise=True,
     )
+
+
+# ─────────────────────────────────────────────
+# 3b. 다중 클래스 합성 (pipe, rebar, background)
+# ─────────────────────────────────────────────
+
+def synthesize_pipe_bscan(freq_hz, depth_m, pipe_diameter, soil_epsr,
+                           domain_x=5.0, domain_z=3.0, dx=0.01,
+                           n_samples=512, pipe_x=None, add_noise=True):
+    """
+    금속 파이프 B-scan 합성
+
+    금속관: 완전 반사 (r ≈ 1.0), 단일 강한 쌍곡선, 하부 반사 없음
+    파이프는 단일 점산란체로 근사 (직경 << 파장)
+
+    Returns: (bscan, time_ns, x_axis, metadata)
+    """
+    from scipy.signal import fftconvolve
+
+    if pipe_x is None:
+        pipe_x = domain_x / 2
+
+    v = soil_velocity(soil_epsr)
+    v_m_s = v * 1e9
+
+    max_tw_ns = 2 * domain_z / v * 1.2
+    dt_ns = max_tw_ns / n_samples
+    dt_s = dt_ns * 1e-9
+
+    time_ns = np.arange(n_samples) * dt_ns
+    time_axis = np.arange(n_samples) * dt_s
+
+    n_traces = int(domain_x / dx)
+    x_axis = np.arange(n_traces) * dx
+
+    t_wavelet = np.arange(-3.0 / freq_hz, 3.0 / freq_hz, dt_s)
+    wavelet = ricker_wavelet(t_wavelet + 3.0 / freq_hz, freq_hz)
+
+    bscan = np.zeros((n_samples, n_traces), dtype=np.float64)
+
+    # ── 1. Direct wave ──
+    direct_t_s = 0.06 / (C0 * 1e9)
+    direct_sample = int(direct_t_s / dt_s)
+    if 0 <= direct_sample < n_samples:
+        bscan[direct_sample, :] += 1.0
+
+    # ── 2. Ground reflection ──
+    r_ground = (np.sqrt(soil_epsr) - 1) / (np.sqrt(soil_epsr) + 1)
+    ground_sample = max(direct_sample + 2, 3)
+    if 0 <= ground_sample < n_samples:
+        bscan[ground_sample, :] += r_ground * 0.8
+
+    # ── 3. 수평 지층 반사 ──
+    for layer_d in [0.8, 1.5, 2.2]:
+        layer_t = 2 * layer_d / v_m_s
+        layer_sample = int(layer_t / dt_s)
+        if 0 <= layer_sample < n_samples:
+            amp = 0.05 * np.random.uniform(0.5, 1.5)
+            bscan[layer_sample, :] += amp
+
+    # ── 4. 파이프 diffraction hyperbola ──
+    # 금속 → 완전 반사 (r ≈ 1.0), 매우 강한 단일 쌍곡선
+    r_pipe = 1.0
+    pipe_radius = pipe_diameter / 2
+
+    for ix in range(n_traces):
+        x = x_axis[ix]
+        # 파이프 상부 (주 반사) — 강한 단일 쌍곡선
+        d_top = depth_m - pipe_radius
+        if d_top > 0:
+            dist = np.sqrt((x - pipe_x) ** 2 + d_top ** 2)
+            t_reflect = 2 * dist / v_m_s
+            sample = int(t_reflect / dt_s)
+            if 0 <= sample < n_samples:
+                amp = r_pipe * (d_top / dist) ** 0.5
+                bscan[sample, ix] += amp
+
+        # 파이프 하부 — 금속은 내부 투과 없으므로 하부 반사 매우 약함
+        # (sinkhole과 달리 하부 쌍곡선 거의 없음)
+        d_bottom = depth_m + pipe_radius
+        dist_b = np.sqrt((x - pipe_x) ** 2 + d_bottom ** 2)
+        t_bottom = 2 * dist_b / v_m_s
+        sample_b = int(t_bottom / dt_s)
+        if 0 <= sample_b < n_samples:
+            # 금속 표면의 약한 다중 반사 (amplitude 매우 낮음)
+            amp_b = r_pipe * 0.05 * (d_bottom / dist_b) ** 0.5
+            bscan[sample_b, ix] -= amp_b
+
+    # ── 5. Ricker wavelet convolution ──
+    for ix in range(n_traces):
+        trace = bscan[:, ix]
+        convolved = fftconvolve(trace, wavelet, mode='full')
+        offset = len(wavelet) // 2
+        bscan[:, ix] = convolved[offset:offset + n_samples]
+
+    # ── 6. 노이즈 ──
+    if add_noise:
+        signal_rms = np.sqrt(np.mean(bscan ** 2))
+        noise_level = signal_rms * 0.05
+        bscan += np.random.randn(n_samples, n_traces) * noise_level
+
+    metadata = {
+        'object_type': 'pipe',
+        'freq_hz': freq_hz,
+        'freq_mhz': freq_hz / 1e6,
+        'depth_m': depth_m,
+        'pipe_diameter': pipe_diameter,
+        'soil_epsr': soil_epsr,
+        'velocity_m_ns': v,
+        'domain_x': domain_x,
+        'domain_z': domain_z,
+        'dx': dx,
+        'n_samples': n_samples,
+        'n_traces': n_traces,
+        'dt_ns': dt_ns,
+        'time_window_ns': max_tw_ns,
+        'pipe_x': pipe_x,
+        'method': 'analytical_synthesis',
+    }
+
+    return bscan.astype(np.float32), time_ns, x_axis, metadata
+
+
+def synthesize_rebar_bscan(freq_hz, depth_m, spacing_m, n_rebars, soil_epsr,
+                            domain_x=5.0, domain_z=3.0, dx=0.01,
+                            n_samples=512, add_noise=True):
+    """
+    주기적 철근 배열 B-scan 합성
+
+    철근: 중간 반사 (r ≈ 0.5-0.8), n개 등간격 소형 쌍곡선
+    각 철근은 직경 ~10-20mm의 점산란체
+
+    Returns: (bscan, time_ns, x_axis, metadata)
+    """
+    from scipy.signal import fftconvolve
+
+    v = soil_velocity(soil_epsr)
+    v_m_s = v * 1e9
+
+    max_tw_ns = 2 * domain_z / v * 1.2
+    dt_ns = max_tw_ns / n_samples
+    dt_s = dt_ns * 1e-9
+
+    time_ns = np.arange(n_samples) * dt_ns
+    n_traces = int(domain_x / dx)
+    x_axis = np.arange(n_traces) * dx
+
+    t_wavelet = np.arange(-3.0 / freq_hz, 3.0 / freq_hz, dt_s)
+    wavelet = ricker_wavelet(t_wavelet + 3.0 / freq_hz, freq_hz)
+
+    bscan = np.zeros((n_samples, n_traces), dtype=np.float64)
+
+    # ── 1. Direct wave ──
+    direct_t_s = 0.06 / (C0 * 1e9)
+    direct_sample = int(direct_t_s / dt_s)
+    if 0 <= direct_sample < n_samples:
+        bscan[direct_sample, :] += 1.0
+
+    # ── 2. Ground reflection ──
+    r_ground = (np.sqrt(soil_epsr) - 1) / (np.sqrt(soil_epsr) + 1)
+    ground_sample = max(direct_sample + 2, 3)
+    if 0 <= ground_sample < n_samples:
+        bscan[ground_sample, :] += r_ground * 0.8
+
+    # ── 3. 수평 지층 반사 ──
+    for layer_d in [0.8, 1.5, 2.2]:
+        layer_t = 2 * layer_d / v_m_s
+        layer_sample = int(layer_t / dt_s)
+        if 0 <= layer_sample < n_samples:
+            amp = 0.05 * np.random.uniform(0.5, 1.5)
+            bscan[layer_sample, :] += amp
+
+    # ── 4. 철근 배열 diffraction hyperbolas ──
+    # 철근 반사 계수 (철 → 높은 전도성, r ≈ 0.7)
+    r_rebar = 0.7
+    rebar_radius = 0.008  # 8mm 반경 (16mm 직경 철근)
+
+    # 철근 x 위치: 도메인 중앙에 등간격 배치
+    total_width = (n_rebars - 1) * spacing_m
+    start_x = (domain_x - total_width) / 2
+    rebar_positions = [start_x + i * spacing_m for i in range(n_rebars)]
+
+    for rebar_x in rebar_positions:
+        for ix in range(n_traces):
+            x = x_axis[ix]
+            # 각 철근에서 단일 쌍곡선
+            dist = np.sqrt((x - rebar_x) ** 2 + depth_m ** 2)
+            t_reflect = 2 * dist / v_m_s
+            sample = int(t_reflect / dt_s)
+            if 0 <= sample < n_samples:
+                amp = r_rebar * (depth_m / dist) ** 0.5
+                bscan[sample, ix] += amp
+
+    # ── 5. Ricker wavelet convolution ──
+    for ix in range(n_traces):
+        trace = bscan[:, ix]
+        convolved = fftconvolve(trace, wavelet, mode='full')
+        offset = len(wavelet) // 2
+        bscan[:, ix] = convolved[offset:offset + n_samples]
+
+    # ── 6. 노이즈 ──
+    if add_noise:
+        signal_rms = np.sqrt(np.mean(bscan ** 2))
+        noise_level = signal_rms * 0.05
+        bscan += np.random.randn(n_samples, n_traces) * noise_level
+
+    metadata = {
+        'object_type': 'rebar',
+        'freq_hz': freq_hz,
+        'freq_mhz': freq_hz / 1e6,
+        'depth_m': depth_m,
+        'spacing_m': spacing_m,
+        'n_rebars': n_rebars,
+        'rebar_positions': rebar_positions,
+        'soil_epsr': soil_epsr,
+        'velocity_m_ns': v,
+        'domain_x': domain_x,
+        'domain_z': domain_z,
+        'dx': dx,
+        'n_samples': n_samples,
+        'n_traces': n_traces,
+        'dt_ns': dt_ns,
+        'time_window_ns': max_tw_ns,
+        'method': 'analytical_synthesis',
+    }
+
+    return bscan.astype(np.float32), time_ns, x_axis, metadata
+
+
+def synthesize_background_bscan(freq_hz, soil_epsr, n_layers=2,
+                                 domain_x=5.0, domain_z=3.0, dx=0.01,
+                                 n_samples=512, add_noise=True):
+    """
+    객체 없는 배경 B-scan 합성 (negative sample)
+
+    지층 반사 + direct wave + 노이즈만 포함
+    n_layers: 지층 수 (각각 랜덤 깊이 + 약한 반사)
+
+    Returns: (bscan, time_ns, x_axis, metadata)
+    """
+    from scipy.signal import fftconvolve
+
+    v = soil_velocity(soil_epsr)
+    v_m_s = v * 1e9
+
+    max_tw_ns = 2 * domain_z / v * 1.2
+    dt_ns = max_tw_ns / n_samples
+    dt_s = dt_ns * 1e-9
+
+    time_ns = np.arange(n_samples) * dt_ns
+    n_traces = int(domain_x / dx)
+    x_axis = np.arange(n_traces) * dx
+
+    t_wavelet = np.arange(-3.0 / freq_hz, 3.0 / freq_hz, dt_s)
+    wavelet = ricker_wavelet(t_wavelet + 3.0 / freq_hz, freq_hz)
+
+    bscan = np.zeros((n_samples, n_traces), dtype=np.float64)
+
+    # ── 1. Direct wave ──
+    direct_t_s = 0.06 / (C0 * 1e9)
+    direct_sample = int(direct_t_s / dt_s)
+    if 0 <= direct_sample < n_samples:
+        bscan[direct_sample, :] += 1.0
+
+    # ── 2. Ground reflection ──
+    r_ground = (np.sqrt(soil_epsr) - 1) / (np.sqrt(soil_epsr) + 1)
+    ground_sample = max(direct_sample + 2, 3)
+    if 0 <= ground_sample < n_samples:
+        bscan[ground_sample, :] += r_ground * 0.8
+
+    # ── 3. 지층 반사 (랜덤 깊이, 약한 진폭) ──
+    rng = np.random.RandomState()
+    layer_depths = sorted(rng.uniform(0.3, domain_z * 0.8, size=n_layers))
+    for layer_d in layer_depths:
+        layer_t = 2 * layer_d / v_m_s
+        layer_sample = int(layer_t / dt_s)
+        if 0 <= layer_sample < n_samples:
+            # 지층 경계에 약간의 수평 변이 (자연스러움)
+            amp_base = rng.uniform(0.03, 0.1)
+            for ix in range(n_traces):
+                variation = rng.normal(0, 1) * 0.5  # ±0.5 sample 변이
+                s = int(layer_sample + variation)
+                if 0 <= s < n_samples:
+                    bscan[s, ix] += amp_base * rng.uniform(0.8, 1.2)
+
+    # ── 4. Ricker wavelet convolution ──
+    for ix in range(n_traces):
+        trace = bscan[:, ix]
+        convolved = fftconvolve(trace, wavelet, mode='full')
+        offset = len(wavelet) // 2
+        bscan[:, ix] = convolved[offset:offset + n_samples]
+
+    # ── 5. 노이즈 (배경은 노이즈 비율 약간 높게) ──
+    if add_noise:
+        signal_rms = np.sqrt(np.mean(bscan ** 2))
+        noise_level = signal_rms * 0.08  # 약간 더 높은 노이즈
+        bscan += np.random.randn(n_samples, n_traces) * noise_level
+
+    metadata = {
+        'object_type': 'background',
+        'freq_hz': freq_hz,
+        'freq_mhz': freq_hz / 1e6,
+        'n_layers': n_layers,
+        'layer_depths': [float(d) for d in layer_depths],
+        'soil_epsr': soil_epsr,
+        'velocity_m_ns': v,
+        'domain_x': domain_x,
+        'domain_z': domain_z,
+        'dx': dx,
+        'n_samples': n_samples,
+        'n_traces': n_traces,
+        'dt_ns': dt_ns,
+        'time_window_ns': max_tw_ns,
+        'method': 'analytical_synthesis',
+    }
+
+    return bscan.astype(np.float32), time_ns, x_axis, metadata
+
+
+# ─────────────────────────────────────────────
+# 3c. 다중 클래스 시뮬레이션 파라미터
+# ─────────────────────────────────────────────
+
+PIPE_SCENARIOS = {
+    'freq_hz': [400e6, 900e6, 2000e6],
+    'depth_m': [0.3, 0.5, 0.8, 1.2],
+    'pipe_diameter': [0.05, 0.1, 0.2],
+    'soil_epsr': [6, 12],
+}
+
+REBAR_SCENARIOS = {
+    'freq_hz': [900e6, 2000e6],
+    'depth_m': [0.05, 0.1, 0.2],
+    'spacing_m': [0.1, 0.15, 0.2],
+    'n_rebars': [3, 5, 7],
+    'soil_epsr': [6, 12],
+}
+
+BACKGROUND_SCENARIOS = {
+    'freq_hz': [400e6, 900e6, 2000e6],
+    'soil_epsr': [6, 9, 12],
+    'n_layers': [1, 2, 3],
+}
+
+
+def run_multiclass_simulations(db=None):
+    """
+    다중 클래스 합성 데이터 생성: pipe + rebar + background
+
+    기존 48개 sinkhole은 재사용, 새로운 3클래스만 생성
+    Returns: list of result dicts
+    """
+    results = []
+
+    # ── Pipe: 3×4×3×2 = 72 시나리오 ──
+    pipe_combos = list(itertools.product(
+        PIPE_SCENARIOS['freq_hz'],
+        PIPE_SCENARIOS['depth_m'],
+        PIPE_SCENARIOS['pipe_diameter'],
+        PIPE_SCENARIOS['soil_epsr'],
+    ))
+    print(f"\n[Pipe] {len(pipe_combos)}개 시나리오 합성...")
+    for i, (freq_hz, depth_m, diam, epsr) in enumerate(pipe_combos):
+        freq_mhz = freq_hz / 1e6
+        label = f"pipe_f{freq_mhz:.0f}_d{depth_m:.1f}_diam{diam:.2f}_er{epsr}"
+        print(f"  [{i+1:2d}/{len(pipe_combos)}] {label}...", end="", flush=True)
+        t0 = time.perf_counter()
+
+        bscan, time_ns, x_axis, metadata = synthesize_pipe_bscan(
+            freq_hz, depth_m, diam, epsr)
+        elapsed = time.perf_counter() - t0
+
+        npy_path = SYNTHETIC_DIR / f"{label}.npy"
+        np.save(str(npy_path), bscan)
+
+        meta_save = {k: (float(v) if isinstance(v, (np.floating, float)) else v)
+                     for k, v in metadata.items()}
+        meta_save['elapsed_s'] = round(elapsed, 3)
+        meta_path = SYNTHETIC_DIR / f"{label}_meta.json"
+        meta_path.write_text(json.dumps(meta_save, indent=2), encoding='utf-8')
+
+        if db:
+            db.register_dataset(
+                name=f"Synthetic pipe: {label}",
+                file_path=str(npy_path), data=bscan,
+                format="synthetic_npy", frequency_mhz=freq_mhz,
+                time_window_ns=metadata.get('time_window_ns', 0),
+                dx_m=metadata.get('dx', DX),
+            )
+
+        results.append({
+            'label': label, 'object_type': 'pipe',
+            'npy_path': str(npy_path), 'shape': bscan.shape,
+            'elapsed_s': round(elapsed, 3), 'metadata': metadata,
+        })
+        print(f" {bscan.shape} {elapsed:.2f}s")
+
+    # ── Rebar: 2×3×3×3×2 = 108 → 축소 54 (n_rebars=[3,5], spacing=[0.1,0.2]) ──
+    rebar_combos = list(itertools.product(
+        REBAR_SCENARIOS['freq_hz'],
+        REBAR_SCENARIOS['depth_m'],
+        [0.1, 0.2],    # spacing 축소
+        [3, 5, 7],      # n_rebars
+        REBAR_SCENARIOS['soil_epsr'],
+    ))
+    print(f"\n[Rebar] {len(rebar_combos)}개 시나리오 합성...")
+    for i, (freq_hz, depth_m, spacing, n_reb, epsr) in enumerate(rebar_combos):
+        freq_mhz = freq_hz / 1e6
+        label = (f"rebar_f{freq_mhz:.0f}_d{depth_m:.2f}_"
+                 f"s{spacing:.2f}_n{n_reb}_er{epsr}")
+        print(f"  [{i+1:2d}/{len(rebar_combos)}] {label}...", end="", flush=True)
+        t0 = time.perf_counter()
+
+        bscan, time_ns, x_axis, metadata = synthesize_rebar_bscan(
+            freq_hz, depth_m, spacing, n_reb, epsr)
+        elapsed = time.perf_counter() - t0
+
+        npy_path = SYNTHETIC_DIR / f"{label}.npy"
+        np.save(str(npy_path), bscan)
+
+        meta_save = {k: (float(v) if isinstance(v, (np.floating, float)) else v)
+                     for k, v in metadata.items()}
+        meta_save['elapsed_s'] = round(elapsed, 3)
+        # rebar_positions는 리스트이므로 그대로 유지
+        meta_path = SYNTHETIC_DIR / f"{label}_meta.json"
+        meta_path.write_text(json.dumps(meta_save, indent=2), encoding='utf-8')
+
+        if db:
+            db.register_dataset(
+                name=f"Synthetic rebar: {label}",
+                file_path=str(npy_path), data=bscan,
+                format="synthetic_npy", frequency_mhz=freq_mhz,
+                time_window_ns=metadata.get('time_window_ns', 0),
+                dx_m=metadata.get('dx', DX),
+            )
+
+        results.append({
+            'label': label, 'object_type': 'rebar',
+            'npy_path': str(npy_path), 'shape': bscan.shape,
+            'elapsed_s': round(elapsed, 3), 'metadata': metadata,
+        })
+        print(f" {bscan.shape} {elapsed:.2f}s")
+
+    # ── Background: 3×3×3 = 27 시나리오 ──
+    bg_combos = list(itertools.product(
+        BACKGROUND_SCENARIOS['freq_hz'],
+        BACKGROUND_SCENARIOS['soil_epsr'],
+        BACKGROUND_SCENARIOS['n_layers'],
+    ))
+    print(f"\n[Background] {len(bg_combos)}개 시나리오 합성...")
+    for i, (freq_hz, epsr, n_layers) in enumerate(bg_combos):
+        freq_mhz = freq_hz / 1e6
+        label = f"bg_f{freq_mhz:.0f}_er{epsr}_layers{n_layers}"
+        print(f"  [{i+1:2d}/{len(bg_combos)}] {label}...", end="", flush=True)
+        t0 = time.perf_counter()
+
+        bscan, time_ns, x_axis, metadata = synthesize_background_bscan(
+            freq_hz, epsr, n_layers=n_layers)
+        elapsed = time.perf_counter() - t0
+
+        npy_path = SYNTHETIC_DIR / f"{label}.npy"
+        np.save(str(npy_path), bscan)
+
+        meta_save = {k: (float(v) if isinstance(v, (np.floating, float)) else v)
+                     for k, v in metadata.items()}
+        meta_save['elapsed_s'] = round(elapsed, 3)
+        meta_path = SYNTHETIC_DIR / f"{label}_meta.json"
+        meta_path.write_text(json.dumps(meta_save, indent=2), encoding='utf-8')
+
+        if db:
+            db.register_dataset(
+                name=f"Synthetic background: {label}",
+                file_path=str(npy_path), data=bscan,
+                format="synthetic_npy", frequency_mhz=freq_mhz,
+                time_window_ns=metadata.get('time_window_ns', 0),
+                dx_m=metadata.get('dx', DX),
+            )
+
+        results.append({
+            'label': label, 'object_type': 'background',
+            'npy_path': str(npy_path), 'shape': bscan.shape,
+            'elapsed_s': round(elapsed, 3), 'metadata': metadata,
+        })
+        print(f" {bscan.shape} {elapsed:.2f}s")
+
+    # 요약
+    by_type = {}
+    for r in results:
+        t = r['object_type']
+        by_type[t] = by_type.get(t, 0) + 1
+    print(f"\n다중 클래스 합성 완료: {len(results)}개")
+    for t, c in by_type.items():
+        print(f"  {t}: {c}개")
+
+    return results
 
 
 # ─────────────────────────────────────────────
