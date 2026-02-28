@@ -16,6 +16,7 @@ GPR(지중레이더) 데이터 처리부터 YOLOv11 기반 싱크홀/매설물 �
 | Phase D-1 | 실측 데이터 Fine-tuning | Mendeley GPR 공개 데이터셋 혼합 학습, mAP50=0.718 |
 | Phase D-2 | FDTD 데이터 확장 | gprMax 6→18개 확장 + flip 증강, mAP50=0.939 |
 | **Phase E-1** | **Guangzhou 직접 라벨링** | **실측 25개 직접 라벨 + 합성 혼합, mAP50=0.848, 도메인 갭 해소** |
+| Phase E-2 | 라벨 품질 개선 + Tunnel 클래스 추가 | CC 기반 bbox 개선, tunnel 10개 추가, 4클래스, mAP50=0.679 |
 
 ## Results
 
@@ -80,6 +81,30 @@ GPR(지중레이더) 데이터 처리부터 YOLOv11 기반 싱크홀/매설물 �
 - 신호 에너지 기반 자동 bbox 생성 (`phase_e1_auto_label.py`)
 - Phase D-2 weights → 실측 20장 + 합성 150장 혼합 fine-tuning (lr=3e-5)
 
+### Phase E-2: 라벨 품질 개선 + Tunnel 클래스 추가 (4클래스)
+
+| Metric | Value |
+|--------|-------|
+| **mAP50** | **0.679** |
+| **mAP50-95** | **0.502** |
+| 학습 시간 | 274초 (~4.5분) |
+| epochs | 33 (early stop, best=13) |
+| 클래스 | sinkhole / pipe / rebar / tunnel (4클래스) |
+
+클래스별 mAP50:
+
+| 클래스 | mAP50 |
+|--------|-------|
+| sinkhole | - |
+| pipe | ~0.77 |
+| rebar | ~0.81 |
+| tunnel | ~0.46 |
+
+- E-1의 전체 폭 bbox(w≈0.998) → Connected Components 기반 정밀 bbox로 개선
+- NJZ .dt(IDS, 2GHz) → tunnel PNG 10개 추가, class_id=3
+- 총 35개 실측 라벨(pipe×15, rebar×10, tunnel×10) + 합성 150장 혼합
+- train=178, val=37, imgsz=416, batch=2 (NAS pagefile 메모리 제약)
+
 ### 도메인 적응 전체 비교
 
 | Phase | 방법 | val mAP50 | Guangzhou 탐지 |
@@ -89,6 +114,7 @@ GPR(지중레이더) 데이터 처리부터 YOLOv11 기반 싱크홀/매설물 �
 | D-1 | Mendeley 실측 fine-tune | 0.718 | 0건 |
 | D-2 | FDTD 확장 | 0.939 | 0건 |
 | **E-1** | **Guangzhou 직접 라벨** | **0.848** | **✅ 탐지 성공** |
+| E-2 | CC bbox 개선 + tunnel 추가 | 0.679 | ✅ (4클래스 확장) |
 
 ### Domain Gap 분석 요약
 
@@ -119,11 +145,14 @@ Mendeley 실측 → [갭2: fine-tuning 후에도 탐지 0] → Guangzhou IDS 실
 │   ├── phase_e1_prepare_labeling.py  # Guangzhou .dt → PNG 변환
 │   ├── phase_e1_auto_label.py     # 신호 에너지 기반 자동 bbox 생성
 │   ├── phase_e1_finetune.py       # Guangzhou 실측 라벨 fine-tuning
+│   ├── phase_e2_relabel.py        # CC 기반 bbox 개선 + tunnel 10개 추가
+│   ├── phase_e2_finetune.py       # 4클래스 fine-tuning (mAP50=0.679)
 │   └── output/                    # 시각화 이미지
 ├── data/gpr/
 │   ├── synthetic/                 # 합성 B-scan (.npy + _meta.json)
 │   ├── yolo_multiclass/           # 3클래스 YOLO 데이터셋
 │   ├── yolo_mixed_real/           # Mendeley+합성 혼합 데이터셋
+│   ├── yolo_gz_e2_mixed/          # Phase E-2 혼합 데이터셋 (4클래스)
 │   └── mendeley_gpr/              # Mendeley GPR 공개 데이터 (별도 다운로드)
 ├── models/
 │   ├── fdtd_compact/              # gprMax .in + .out 파일
@@ -132,10 +161,11 @@ Mendeley 실측 → [갭2: fine-tuning 후에도 탐지 0] → Guangzhou IDS 실
 │       ├── finetune_pseudo/       # Phase C fine-tuned 모델
 │       ├── finetune_real/         # Phase D-1 fine-tuned 모델 (mAP50=0.718)
 │       ├── finetune_fdtd/         # Phase D-2 fine-tuned 모델 (mAP50=0.939)
-│       └── finetune_gz_e1/        # Phase E-1 fine-tuned 모델 (mAP50=0.848)
+│       ├── finetune_gz_e1/        # Phase E-1 fine-tuned 모델 (mAP50=0.848)
+│       └── finetune_gz_e2/        # Phase E-2 fine-tuned 모델 (mAP50=0.679, 4클래스)
 ├── guangzhou_labeled/
-│   ├── labels/                    # YOLO 라벨 25개 (pipe×15, rebar×10)
-│   ├── manifest.json              # 소스 경로 매핑
+│   ├── labels/                    # YOLO 라벨 35개 (pipe×15, rebar×10, tunnel×10)
+│   ├── manifest.json              # 소스 경로 매핑 (nc=4)
 │   └── auto_label_review.png      # 자동 라벨링 검토 이미지
 ├── db/gpr_processing.db           # SQLite
 └── gpr_env.yml                    # conda 환경 설정
@@ -197,6 +227,10 @@ python src/phase_d_realdata_finetune.py  # Mendeley fine-tuning
 python src/phase_e1_prepare_labeling.py  # .dt → PNG 25개 변환
 python src/phase_e1_auto_label.py        # 자동 bbox 라벨 생성
 python src/phase_e1_finetune.py          # fine-tuning (mAP50=0.848)
+
+# Phase E-2: CC bbox 개선 + Tunnel 클래스 추가
+python src/phase_e2_relabel.py           # CC 기반 bbox 재생성 + tunnel 10개 추가
+python src/phase_e2_finetune.py          # 4클래스 fine-tuning (mAP50=0.679)
 ```
 
 ## Troubleshooting (Windows)
@@ -216,6 +250,10 @@ python src/phase_e1_finetune.py          # fine-tuning (mAP50=0.848)
 | RAR 압축 해제 (Windows) | `unrar` 미설치 | `C:\Windows\System32\tar.exe -xf file.rar` (bsdtar 3.5.2 내장) |
 | gprMax 빌드 (Windows) | MSVC 없음, Cython 컴파일 실패 | `pydistutils.cfg`에 `compiler=mingw32` 설정 후 MinGW gcc 사용 |
 | bandpass_filter 단위 | `dt` 파라미터 혼동 (ns vs s) | 반드시 초(s) 단위: `dt_sec = dt_ns * 1e-9` |
+| NAS pagefile 메모리 | `numpy._ArrayMemoryError: Unable to allocate 977 KiB` — 충분한 RAM에도 alloc 실패 | E:\pagefile.sys(NAS 마운트) 사용 시 발생. `mosaic=0.0, plots=False, batch=2` 설정, 다른 프로세스 종료 |
+| cuBLAS pinned memory | `CUBLAS_STATUS_ALLOC_FAILED` — GPU 학습 초기 즉시 크래시 | CPU RAM 부족 시 cuBLAS가 pinned host memory 할당 실패. Chrome/Discord 등 종료로 5 GB 이상 확보 |
+| YOLO nc 불일치 | `nc=3` 모델로 `nc=4` 데이터셋 학습 시 head 오류 | ultralytics 8.4.x는 자동으로 `Overriding model.yaml nc=3 with nc=4` 처리 — 별도 조치 불필요 |
+| ultralytics 한글 경로 | dataset.yaml 경로가 'Ϸ' 등 깨진 문자로 읽힘 → FileNotFoundError | `yaml_path.write_text(..., encoding='utf-8')` 로 UTF-8 명시 저장 |
 
 ## Requirements
 

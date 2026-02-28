@@ -1,5 +1,5 @@
-path: E:/JOYNAS_home/projects_ì™„ë£Œ/gpr-sinkhole-detection/guangzhou_labeled
+path: E:/JOYNAS_home/projects_¿Ï·á/gpr-sinkhole-detection/guangzhou_labeled
 train: images
 val:   images
-nc: 3
-names: ['sinkhole', 'pipe', 'rebar']
+nc: 4
+names: ['sinkhole', 'pipe', 'rebar', 'tunnel']
