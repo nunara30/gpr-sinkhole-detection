@@ -14,6 +14,7 @@ GPR(지중레이더) 데이터 처리부터 YOLOv11 기반 싱크홀/매설물 �
 | Phase B | gprMax FDTD 시뮬레이션 | Maxwell 방정식 기반 물리 시뮬레이션 6개 |
 | Phase C | Pseudo-labeling | Semi-supervised 시도 → 0% 수락률, 도메인 갭 한계 |
 | Phase D-1 | 실측 데이터 Fine-tuning | Mendeley GPR 공개 데이터셋 혼합 학습, mAP50=0.718 |
+| Phase D-2 | FDTD 데이터 확장 | gprMax 6→18개 확장 + flip 증강, mAP50=0.939 |
 
 ## Results
 
@@ -56,14 +57,33 @@ GPR(지중레이더) 데이터 처리부터 YOLOv11 기반 싱크홀/매설물 �
 | 데이터 | Mendeley 750개 + 합성 375개 |
 | Guangzhou 탐지 | 여전히 0건 (장비 간 도메인 갭) |
 
+### Phase D-2: FDTD 데이터 확장 Fine-tuning
+
+| Metric | Value |
+|--------|-------|
+| Best mAP50 (혼합 val) | **0.939** (epoch 26/45) |
+| Best mAP50-95 | 0.747 |
+| FDTD 시나리오 | 6 → 18개 (+ flip 증강 = 36개) |
+| Guangzhou 탐지 | 여전히 0건 |
+
+### Phase D 종합 비교 (3-way)
+
+| 방법 | val mAP50 | Guangzhou 탐지 |
+|------|----------|---------------|
+| 해석적 합성 base | 0.985 | 0건 |
+| Phase D-1: Mendeley 실측 | 0.718 | 0건 |
+| Phase D-2: FDTD 확장 | **0.939** | 0건 |
+
 ### Domain Gap 분석 요약
 
 ```
-합성 B-scan → [갭1: conf=0.05에도 탐지 0] → Mendeley 실측 GPR
+합성(해석적/FDTD) → [갭1: conf=0.05에도 탐지 0] → Mendeley 실측 GPR
 Mendeley 실측 → [갭2: fine-tuning 후에도 탐지 0] → Guangzhou IDS 실측
 
 "탐지 없음(background)" 일반화: ✅ (FP=0 유지)
-"탐지 있음(객체)"   일반화: ❌ (TP=0, 합성→실측)
+"탐지 있음(객체)"   일반화: ❌ (TP=0, 어떤 방법이든)
+
+근본 해결책: Guangzhou 직접 소량 라벨링
 ```
 
 ## Project Structure
