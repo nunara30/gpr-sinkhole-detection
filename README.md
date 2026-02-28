@@ -17,6 +17,7 @@ GPR(지중레이더) 데이터 처리부터 YOLOv11 기반 싱크홀/매설물 �
 | Phase D-2 | FDTD 데이터 확장 | gprMax 6→18개 확장 + flip 증강, mAP50=0.939 |
 | **Phase E-1** | **Guangzhou 직접 라벨링** | **실측 25개 직접 라벨 + 합성 혼합, mAP50=0.848, 도메인 갭 해소** |
 | Phase E-2 | 라벨 품질 개선 + Tunnel 클래스 추가 | CC 기반 bbox 개선, tunnel 10개 추가, 4클래스, mAP50=0.679 |
+| **Phase F** | **배치 추론 + 현장 워크플로우 검증** | **미학습 .dt 60개 배치 추론, 슬라이딩 윈도우 GIF, 인터랙티브 뷰어** |
 
 ## Results
 
@@ -105,6 +106,31 @@ GPR(지중레이더) 데이터 처리부터 YOLOv11 기반 싱크홀/매설물 �
 - 총 35개 실측 라벨(pipe×15, rebar×10, tunnel×10) + 합성 150장 혼합
 - train=178, val=37, imgsz=416, batch=2 (NAS pagefile 메모리 제약)
 
+### Phase F: 배치 추론 + 현장 워크플로우 검증
+
+Phase E-2 모델(mAP50=0.679)을 학습에 사용되지 않은 Guangzhou .dt 파일에 적용해 전체 파이프라인을 검증.
+
+| 항목 | 내용 |
+|------|------|
+| 대상 파일 | pipe×20 / rebar×20 / tunnel×20 (학습 ZON 제외) |
+| conf threshold | 0.05 |
+| Recall | pipe 0.00 / rebar 0.00 / tunnel 0.00 |
+| FP 패턴 | 탐지 시 대부분 sinkhole 클래스로 오분류 |
+
+**3가지 구현 방식:**
+
+| 스크립트 | 방식 | 출력 |
+|----------|------|------|
+| `phase_f_realtime_inference.py` | 배치 추론 | PNG 60개 + detection_log.csv + summary 그리드 |
+| `phase_f2_sliding_window.py` | 슬라이딩 윈도우 | 클래스별 GIF (pipe 50프레임 / rebar 27프레임 / tunnel 50프레임) |
+| `phase_f3_interactive_viewer.py` | 인터랙티브 뷰어 | tkinter GUI (파일 목록 + conf 슬라이더 실시간 탐지) |
+
+**낮은 Recall 원인 분석:**
+- 학습 데이터 35개(pseudo-label 기반) → 미학습 ZON에 대한 일반화 부족
+- 베이스 모델의 sinkhole 편향 → FP 예측이 주로 sinkhole 클래스로 출력
+- 학습 ZON과 테스트 ZON의 스캔 조건 차이 (도메인 갭)
+- → 추가 라벨링 + re-finetune으로 개선 가능
+
 ### 도메인 적응 전체 비교
 
 | Phase | 방법 | val mAP50 | Guangzhou 탐지 |
@@ -115,6 +141,7 @@ GPR(지중레이더) 데이터 처리부터 YOLOv11 기반 싱크홀/매설물 �
 | D-2 | FDTD 확장 | 0.939 | 0건 |
 | **E-1** | **Guangzhou 직접 라벨** | **0.848** | **✅ 탐지 성공** |
 | E-2 | CC bbox 개선 + tunnel 추가 | 0.679 | ✅ (4클래스 확장) |
+| F | 배치 추론 (미학습 파일) | - | ⚠️ recall≈0 (도메인 갭, 추가 라벨 필요) |
 
 ### Domain Gap 분석 요약
 
@@ -147,6 +174,9 @@ Mendeley 실측 → [갭2: fine-tuning 후에도 탐지 0] → Guangzhou IDS 실
 │   ├── phase_e1_finetune.py       # Guangzhou 실측 라벨 fine-tuning
 │   ├── phase_e2_relabel.py        # CC 기반 bbox 개선 + tunnel 10개 추가
 │   ├── phase_e2_finetune.py       # 4클래스 fine-tuning (mAP50=0.679)
+│   ├── phase_f_realtime_inference.py  # 배치 추론 + summary 그리드
+│   ├── phase_f2_sliding_window.py     # 슬라이딩 윈도우 GIF 애니메이션
+│   ├── phase_f3_interactive_viewer.py # tkinter 인터랙티브 뷰어
 │   └── output/                    # 시각화 이미지
 ├── data/gpr/
 │   ├── synthetic/                 # 합성 B-scan (.npy + _meta.json)
@@ -231,6 +261,11 @@ python src/phase_e1_finetune.py          # fine-tuning (mAP50=0.848)
 # Phase E-2: CC bbox 개선 + Tunnel 클래스 추가
 python src/phase_e2_relabel.py           # CC 기반 bbox 재생성 + tunnel 10개 추가
 python src/phase_e2_finetune.py          # 4클래스 fine-tuning (mAP50=0.679)
+
+# Phase F: 배치 추론 + 현장 워크플로우 검증
+python src/phase_f_realtime_inference.py    # 배치 추론 (PNG 60개 + CSV + summary)
+python src/phase_f2_sliding_window.py       # 슬라이딩 윈도우 GIF (클래스별 애니메이션)
+python src/phase_f3_interactive_viewer.py   # tkinter 인터랙티브 뷰어 (GUI)
 ```
 
 ## Troubleshooting (Windows)
