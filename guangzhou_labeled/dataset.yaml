@@ -1,0 +1,5 @@
+path: E:/JOYNAS_home/projects_완료/gpr-sinkhole-detection/guangzhou_labeled
+train: images
+val:   images
+nc: 3
+names: ['sinkhole', 'pipe', 'rebar']

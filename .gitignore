@@ -41,6 +41,20 @@ data/gpr/yolo_pseudolabel/images/
 data/gpr/yolo_pseudolabel/labels/
 data/gpr/yolo_mixed_real/images/
 data/gpr/yolo_mixed_real/labels/
+data/gpr/yolo_fdtd/images/
+data/gpr/yolo_fdtd/labels/
+data/gpr/yolo_gz_e1_mixed/images/
+data/gpr/yolo_gz_e1_mixed/labels/
+
+# === Phase E-1 라벨링 이미지 (스크립트로 재생성 가능) ===
+guangzhou_labeled/images/
+
+# === YOLO 학습 결과 weights (large, best.pt만 제외하고 무시) ===
+models/yolo_runs/finetune_gz_e1/run/weights/last.pt
+models/yolo_runs/finetune_gz_e1/run/*.png
+models/yolo_runs/finetune_gz_e1/run/*.jpg
+models/fdtd_expand/
+models/fdtd_compact/
 
 # === Mendeley GPR 데이터 (CC BY 4.0, Mendeley에서 직접 다운로드) ===
 data/gpr/mendeley_gpr/
